@@ -1,105 +1,64 @@
-name: دانلود لینک مستقیم فیلتر شده
+name: Download Large File in Chunks and Pack to RAR
 
 on:
   workflow_dispatch:
-    inputs:
-      download_url:
-        description: 'آدرس فایل برای دانلود'
-        required: true
-        type: string
-      output_folder:
-        description: 'پوشه ذخیره فایل'
-        required: false
-        type: string
-        default: 'downloads'
-      output_filename:
-        description: 'نام دلخواه برای فایل (در صورت خالی بودن، نام اصلی استفاده می‌شود)'
-        required: false
-        type: string
-        default: ''
-      archive_name:
-        description: 'نام پایه برای بایگانی RAR (فقط در صورت تقسیم فایل استفاده می‌شود)'
-        required: false
-        type: string
-        default: ''
 
 jobs:
-  download-and-conditionally-split:
+  chunked-download:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install RAR
+      - name: Install rar
         run: sudo apt-get update && sudo apt-get install -y rar
 
-      - name: Create output folder
-        run: mkdir -p "${{ github.event.inputs.output_folder }}"
-
-      - name: Download file
-        id: download
+      - name: Get file size and download in chunks if >95MB
+        env:
+          URL: "https://example.com/largefile.zip"   # لینک فایل بزرگ
         run: |
-          URL="${{ github.event.inputs.download_url }}"
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          CUSTOM_NAME="${{ github.event.inputs.output_filename }}"
-          
-          cd "$FOLDER"
-          if [ -n "$CUSTOM_NAME" ]; then
-            FILENAME="$CUSTOM_NAME"
-          else
-            FILENAME=$(basename "$URL")
-          fi
-          
-          wget -O "$FILENAME" "$URL"
-          
-          # Store filename and size (in bytes) for next steps
-          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
-          echo "size_bytes=$(stat -c%s "$FILENAME")" >> $GITHUB_OUTPUT
-          echo "Downloaded: $FILENAME ($(numfmt --to=iec $size_bytes))"
+          # دریافت اندازه فایل (به بایت)
+          SIZE=$(curl -sI "$URL" | grep -i "Content-Length" | awk '{print $2}' | tr -d '\r')
+          THRESHOLD=$((95 * 1024 * 1024))  # 95 مگابایت
+          CHUNK_SIZE=$((10 * 1024 * 1024)) # هر تکه 10 مگابایت
 
-      - name: Conditional split (if file > 99 MB)
-        id: split
-        run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
-          
-          cd "$FOLDER"
-          
-          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
-            echo "File size ${SIZE_MB}MB exceeds 99MB – splitting into 95MB RAR parts."
-            
-            # If archive_name is empty, use the file's base name (without extension)
-            INPUT_ARCHIVE_NAME="${{ github.event.inputs.archive_name }}"
-            if [ -n "$INPUT_ARCHIVE_NAME" ]; then
-              ARCHIVE_NAME="$INPUT_ARCHIVE_NAME"
-            else
-              BASENAME="${FILENAME%.*}"
-              ARCHIVE_NAME="$BASENAME"
-            fi
-            
-            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
-            
-            # Remove original file after successful split
-            rm "$FILENAME"
-            
-            echo "split_done=true" >> $GITHUB_OUTPUT
-            echo "Split completed. Parts created:"
-            ls -lh "${ARCHIVE_NAME}.part"*.rar
+          if [ -z "$SIZE" ]; then
+            echo "Could not determine file size, downloading normally."
+            curl -L -o downloaded_file "$URL"
+          elif [ "$SIZE" -le "$THRESHOLD" ]; then
+            echo "File size ($SIZE bytes) <= 95MB, downloading normally."
+            curl -L -o downloaded_file "$URL"
           else
-            echo "File size ${SIZE_MB}MB is ≤99MB – keeping original file (no RAR)."
-            echo "split_done=false" >> $GITHUB_OUTPUT
+            echo "File size ($SIZE bytes) > 95MB, downloading in chunks..."
+            # محاسبه تعداد تکه‌ها
+            PARTS=$(( (SIZE + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+            echo "Total parts: $PARTS"
+
+            # دانلود تکه‌ها (در حلقه)
+            for ((i=0; i<PARTS; i++)); do
+              START=$((i * CHUNK_SIZE))
+              END=$((START + CHUNK_SIZE - 1))
+              if [ $END -ge $SIZE ]; then
+                END=$((SIZE - 1))
+              fi
+              echo "Downloading part $i: bytes $START-$END"
+              curl -L -r "$START-$END" -o "chunk_$i" "$URL"
+            done
+
+            # چسباندن تکه‌ها
+            cat chunk_* > downloaded_file
+            rm chunk_*
           fi
 
-      - name: Commit and push to repository
+      - name: Create RAR archive (split into 95MB volumes if needed)
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.output_folder }}"
-          git commit -m "Add file from ${{ github.event.inputs.download_url }} [skip ci]" || echo "No changes to commit"
-          git push
+          # اگر می‌خواهید خود فایل RAR نیز به حجم 95 مگابایت تکه شود:
+          rar a -v95m -r final_archive.rar downloaded_file
+
+      - name: Upload RAR volumes as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rar-parts
+          path: |
+            final_archive.part*.rar
+            final_archive.rar
